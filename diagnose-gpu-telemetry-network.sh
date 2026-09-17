@@ -64,6 +64,28 @@ run_retry() {
 
 echo "Writing diagnostic report to ${OUT}"
 
+# The previous run's debug pod died mid-command (PodSecurity admission warning,
+# non-fatal) and never got cleaned up by --rm, so a rerun hit "AlreadyExists".
+# Clear out anything left over from a prior run before starting.
+for ns_pod in "project-gavin-test:aibom-diag-thanos-check" "nvidia-gpu-operator:aibom-diag-net-local" "openshift-user-workload-monitoring:aibom-diag-net-cross"; do
+    ns="${ns_pod%%:*}"; pod="${ns_pod##*:}"
+    oc ${AS_FLAG} delete pod "${pod}" -n "${ns}" --ignore-not-found --wait=true >/dev/null 2>&1
+done
+
+section "Platform vs. user-workload monitoring split — which Prometheus actually claims the nvidia-gpu-operator namespace"
+# A ServiceMonitor's namespace can be claimed by the platform Prometheus
+# (prometheus-k8s) instead of prometheus-user-workload, via the
+# openshift.io/cluster-monitoring=true namespace label or the Prometheus CR's
+# own serviceMonitorNamespaceSelector/serviceMonitorSelector. The prior run
+# confirmed prometheus-user-workload has ZERO dcgm targets/metrics even though
+# the ServiceMonitor, Service, and exporter are all correctly configured — so
+# before concluding it's NetworkPolicy, rule out "the wrong Prometheus owns
+# this namespace" first, since that's a config fix, not a network fix.
+run_retry "oc ${AS_FLAG} get ns nvidia-gpu-operator -o jsonpath='{.metadata.labels}'"
+run_retry "oc ${AS_FLAG} get prometheus -A -o yaml | grep -E 'name:|namespace:|serviceMonitorNamespaceSelector|serviceMonitorSelector|matchLabels|matchExpressions' -A3"
+run_retry "oc ${AS_FLAG} exec -n openshift-monitoring prometheus-k8s-0 -c prometheus -- wget -qO- http://localhost:9090/api/v1/targets | tr ',' '\n' | grep -i -B2 -A10 dcgm"
+run_retry "oc ${AS_FLAG} exec -n openshift-monitoring prometheus-k8s-0 -c prometheus -- wget -qO- 'http://localhost:9090/api/v1/label/__name__/values' | tr ',' '\n' | grep -i dcgm"
+
 section "Full Prometheus target list (user-workload), retried — looking for the dcgm-exporter target and its health/lastError"
 run_retry "oc ${AS_FLAG} exec -n openshift-user-workload-monitoring prometheus-user-workload-0 -c prometheus -- wget -qO- http://localhost:9090/api/v1/targets | python3 -m json.tool 2>/dev/null || oc ${AS_FLAG} exec -n openshift-user-workload-monitoring prometheus-user-workload-0 -c prometheus -- wget -qO- http://localhost:9090/api/v1/targets"
 
